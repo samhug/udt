@@ -54,7 +54,7 @@ func (c *Connection) ExecutePhantom(cmd string) (*PhantomProc, error) {
 		strconv.Quote(cmd),
 	)
 	if err := session.Run(fullCmd); err != nil {
-		return nil, fmt.Errorf("udt execute failed: %q", err)
+		return nil, fmt.Errorf("udt execute failed for command '%s': %s", fullCmd, err)
 	}
 
 	// Collect the output
@@ -121,7 +121,12 @@ func (c *Connection) RetreiveOutput(proc *PhantomProc) (io.ReadCloser, error) {
 
 	return newHookedCloser(f, func() error {
 		defer session.Close()
-		defer f.Close()
+		f.Close()
+
+		// Remove the COMO file
+		if err = session.Remove(proc.OutFile); err != nil {
+			return fmt.Errorf("error cleaning up temporary COMO file (%s): %s", proc.OutFile, err)
+		}
 		return nil
 	}), nil
 }
