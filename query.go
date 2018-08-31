@@ -1,26 +1,20 @@
 package udt
 
+// NewQuery creates a new Query object from a query string
 func NewQuery(query string) *Query {
 	return &Query{
 		query: query,
 	}
 }
 
+// Query is an object representing a query to be run on a Client
 type Query struct {
 	query string
 }
 
-func (q *Query) Run(conn *Connection) (*Results, error) {
-	proc, err := conn.ExecutePhantom(q.query)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := conn.Wait(proc); err != nil {
-		return nil, err
-	}
-
-	r, err := conn.RetreiveOutput(proc)
+// Run runs the query on the provided Client returning a Results object
+func (q *Query) Run(client *Client) (*Results, error) {
+	r, err := client.ExecutePhantom(q.query)
 	if err != nil {
 		return nil, err
 	}

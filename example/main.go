@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -20,7 +19,8 @@ func main() {
 	hostPtr := flag.String("host", "", "IP/Hostname of server")
 	portPtr := flag.Int("port", 22, "SSH port")
 	udtBinPtr := flag.String("udtbin", "/usr/udthome/bin", "$UDTBIN dir")
-	udtHomePtr := flag.String("udthome", "/usr/udthome/demo", "$UDTHOME dir")
+	udtHomePtr := flag.String("udthome", "/usr/udthome", "$UDTHOME dir")
+	udtAcctPtr := flag.String("udtacct", "/usr/udthome/demo", "UDT account dir")
 
 	flag.Parse()
 
@@ -47,12 +47,15 @@ func main() {
 		return
 	}
 
-	conn := udt.NewConnection(sshClient, *udtBinPtr, *udtHomePtr)
+	conn := udt.NewConnection(sshClient, *udtBinPtr, *udtHomePtr, *udtAcctPtr)
 
 	fmt.Println("=== Example Basic ===")
 	fmt.Println("Query basic server information")
 
-	proc, err := conn.ExecutePhantom("WHAT")
+	// WHAT
+	// LIST DICT STUDENT
+	// LIST STUDENT LNAME CGA TOXML SAMPLE 1
+	proc, err := conn.ExecutePhantomAsync("LIST CUSTOMER NAME TAPE_INFO TOXML SAMPLE 1")
 	if err != nil {
 		fmt.Printf("UDT Execute failed: %s", err)
 		return
@@ -63,7 +66,7 @@ func main() {
 		return
 	}
 
-	buf, err := conn.RetreiveOutput(proc)
+	buf, err := conn.RetrieveOutput(proc)
 	if err != nil {
 		fmt.Printf("unable to retrieve UDT output: %s", err)
 		return
@@ -76,31 +79,33 @@ func main() {
 	}
 	fmt.Println(string(out))
 
-	q := "LIST CLIENTS NAME COMPANY ADDRESS SAMPLE 3 TOXML"
+	/*
+		q := "LIST CLIENTS NAME COMPANY ADDRESS SAMPLE 3 TOXML"
 
-	fmt.Println("=== Example Query ===")
-	fmt.Println("Run the query:", q)
+		fmt.Println("=== Example Query ===")
+		fmt.Println("Run the query:", q)
 
-	query := udt.NewQuery(q)
-	r, err := query.Run(conn)
-	if err != nil {
-		fmt.Printf("Error running query: %s", err)
-		return
-	}
-	defer r.Close()
-
-	for {
-		record, err := r.ReadRecord()
+		query := udt.NewQuery(q)
+		r, err := query.Run(conn)
 		if err != nil {
-			if err == io.EOF {
+			fmt.Printf("Error running query: %s", err)
+			return
+		}
+		defer r.Close()
+
+		for {
+			record, err := r.ReadRecord()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				fmt.Printf("Error: %s\n", err)
 				break
 			}
-			fmt.Printf("Error: %s\n", err)
-			break
-		}
 
-		fmt.Printf("%q\n", record)
-	}
+			fmt.Printf("%q\n", record)
+		}
+	*/
 }
 
 // From https://stackoverflow.com/a/32768479/2069095
