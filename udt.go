@@ -47,6 +47,22 @@ type Client struct {
 	sshClient *ssh.Client
 }
 
+// UdtProc represents a PHANTOM process running on the database
+type UdtProc struct {
+	Stdout  io.Reader
+	session *ssh.Session
+}
+
+// Wait waits for the process to complete
+func (p *UdtProc) Wait() error {
+	return p.session.Wait()
+}
+
+// Close closes the underlying session
+func (p *UdtProc) Close() error {
+	return p.session.Close()
+}
+
 // PhantomProc represents a PHANTOM process running on the database
 type PhantomProc struct {
 	Pid     int
@@ -109,8 +125,8 @@ func (c *Client) ExecutePhantomAsync(cmd string) (_ *PhantomProc, err error) {
 	}, nil
 }
 
-// Wait will block until the specified PHANTOM process terminates
-func (c *Client) Wait(proc *PhantomProc) (err error) {
+// WaitPhantom will block until the specified PHANTOM process terminates
+func (c *Client) WaitPhantom(proc *PhantomProc) (err error) {
 
 	// Open a new SSH session
 	session, err := c.sshClient.NewSession()
@@ -129,6 +145,40 @@ func (c *Client) Wait(proc *PhantomProc) (err error) {
 	return nil
 }
 
+func (c *Client) Execute(cmd string) (*UdtProc, error) {
+
+	// Open a new SSH session
+	session, err := c.sshClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH session: %s", err)
+	}
+
+	udtProc := UdtProc{
+		session: session,
+	}
+
+	// Get an io.Reader for stdout
+	udtProc.Stdout, err = session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("failed to attach to SSH stdout pipe: %s", err)
+	}
+
+	// TODO: Fix shell escaping here, strconv.Quote is for escaping Go string literals not shell commands
+	shellCmd := fmt.Sprintf("UDTHOME=%s;UDTBIN=%s; cd %s; $UDTBIN/udt %s",
+		strconv.Quote(c.env.UdtHome),
+		strconv.Quote(c.env.UdtBin),
+		strconv.Quote(c.env.UdtAcct),
+		strconv.Quote(cmd),
+	)
+	if err := session.Start(shellCmd); err != nil {
+		session.Close()
+		return nil, fmt.Errorf("Failed to start command '%s'\n===\n%s", shellCmd, err)
+	}
+
+	return &udtProc, nil
+}
+
 // ExecutePhantom runs the provided unidata command as a PHANTOM process, waits for it to complete, and returns a reader with output
 func (c *Client) ExecutePhantom(cmd string) (io.ReadCloser, error) {
 
@@ -137,8 +187,8 @@ func (c *Client) ExecutePhantom(cmd string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("ExecutePhantomAsync failed: %s", err)
 	}
 
-	if err := c.Wait(proc); err != nil {
-		return nil, fmt.Errorf("Wait failed: %s", err)
+	if err := c.WaitPhantom(proc); err != nil {
+		return nil, fmt.Errorf("WaitPhantom failed: %s", err)
 	}
 
 	r, err := c.RetrieveOutput(proc)
@@ -260,6 +310,39 @@ func (c *Client) SavedListDelete(savedListName string) (err error) {
 	return nil
 }
 
+// RetrieveAndDeleteFile returns a ReadCloser for the contents of the file at the given path.
+// path should be relative to UdtAcct. The file is deleted when Close() is called on the returned
+// ReadCloser.
+func (c *Client) RetrieveAndDeleteFile(path string) (_ io.ReadCloser, err error) {
+
+	// Initialize SFTP client
+	client, err := sftp.NewClient(c.sshClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize SFTP client: %s", err)
+	}
+
+	path = c.env.UdtAcct + "/" + path
+
+	// Open the specified file
+	f, err := client.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file (%s): %s", path, err)
+	}
+
+	return newHookedCloser(f, func() (err error) {
+		defer safeClose(client, "failed to close SFTP client", &err)
+		if err = f.Close(); err != nil {
+			return fmt.Errorf("error closing file: %s", err)
+		}
+
+		// Remove the file
+		if err = client.Remove(path); err != nil {
+			return fmt.Errorf("error removing file (%s): %s", path, err)
+		}
+		return nil
+	}), nil
+}
+
 // RetrieveOutput retrieves the output of the provided PhantomProc
 func (c *Client) RetrieveOutput(proc *PhantomProc) (_ io.ReadCloser, err error) {
 
@@ -375,7 +458,7 @@ func safeClose(c io.Closer, msg string, err *error) {
 
 func safeCloseIgnoreEOF(c io.Closer, msg string, err *error) {
 	// https://stackoverflow.com/questions/42590308/proper-way-to-close-a-crypto-ssh-session-freeing-all-resources-in-golang#comment72394178_42590388
-	// session.Close() will return io.EOF if called after session.Wait()/session.Run()
+	// session.Close() will return io.EOF if called after session.WaitPhantom()/session.Run()
 	// we want to ignore the EOF
 	if cerr := c.Close(); cerr != nil && cerr != io.EOF && err == nil {
 		*err = fmt.Errorf("%s: %s", msg, cerr)

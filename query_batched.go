@@ -1,13 +1,14 @@
 package udt
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/hashicorp/go-uuid"
 )
@@ -35,7 +36,7 @@ func NewQueryBatched(client *Client, query *QueryConfig) (*QueryBatched, error) 
 		query:  query,
 	}
 
-	if err := q.doSelect(); err != nil {
+	if err := q.run(); err != nil {
 		return nil, err
 	}
 
@@ -49,127 +50,182 @@ type QueryBatched struct {
 
 	err          error
 	queryUUID    string
+	udtProgName  string
+	udtProc      *UdtProc
+	procScanner  *bufio.Scanner
 	recordCount  int
 	batchCursor  int
 	batchRecords RecordReader
 }
 
 const udtProgFile = "BP"
-
-const selectSrcTmpl = `
+const udtProgSrcTmpl = `
 $BASICTYPE "U"
-EXECUTE %s
-EXECUTE %s
+
+** Should be a statement that will populate select list 0
+** Ex: 'SELECT CUSTOMER'
+SELECTSTMT = {{.SelectStmt}}
+
+** File from which to list records
+** Ex: 'CUSTOMER'
+LISTFILE = {{.ListFile}}
+
+** Space delimited list of fields to retrieve
+** Ex: 'NAME CITY'
+FILEFIELDS = {{.FileFields}}
+
+** Unique id to prefix output file names
+** Ex: '730ba7a4-f267-11e8-8eb2-f2801f1b9fd1'
+QUERYID = {{.QueryId}}
+
+** Number of records to include in each result batch
+** Ex: 10000
+BATCHSIZE = {{.BatchSize}}
+
+** Set DEBUG=1 to output debug messages
+DEBUG = {{.Debug}}
+
+** ======
+
+CURSOR = 0
+
+IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|will run (':SELECTSTMT:') and retrieve results from (':LISTFILE:') in batches of (':BATCHSIZE:')'
+
+IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|select records'
+GOSUB DOSELECT
+IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|selected ':RECORDCOUNT:' records'
+PRINT '|SELECTED|':RECORDCOUNT
+
+BATCHI = 0
+LOOP WHILE BATCHI < RECORDCOUNT/BATCHSIZE DO
+  IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|build select list for batch ':BATCHI
+
+  GOSUB DOGETNEXTBATCH
+
+  IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|list batch ':BATCHI
+
+  GOSUB DOLIST
+
+  BATCHI += 1
+REPEAT
+
+IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|done'
+
+PRINT '|DONE'
+
+GOSUB EXIT
+
+** ======
+
+DOSELECT:
+  EXECUTE SELECTSTMT
+  RECORDCOUNT = SYSTEM(11)
+  EXECUTE 'SAVE.LIST'
+  EXECUTE 'GET.LIST TO 1'
+  EXECUTE 'DELETE.LIST'
+  RETURN
+
+DOGETNEXTBATCH:
+  RECORDIDS = ''
+
+  ** The index of the last record of the batch
+  LASTI = CURSOR + BATCHSIZE - 1
+  IF LASTI > RECORDCOUNT-1 THEN LASTI = RECORDCOUNT-1
+
+  LOOP WHILE CURSOR <= LASTI DO
+
+    ** Read the next record id from select list 1
+    READNEXT RECORD.ID FROM 1 ELSE
+      PRINT '|ERROR|failed to READNEXT for record number ':CURSOR
+      EXIT
+    END
+
+    RECORDIDS = INSERT(RECORDIDS, -1, 0, 0, RECORD.ID)
+    CURSOR += 1
+  REPEAT
+
+  FORMLIST RECORDIDS TO 0
+
+  RETURN
+
+DOLIST:
+  OUTFILENAME = QUERYID:'_':BATCHI
+  LISTSTMT = 'LIST ':LISTFILE:' ':FILEFIELDS:' TOXML TO ':OUTFILENAME
+  EXECUTE LISTSTMT
+  PRINT '|RESULTBATCH|':BATCHI:'|_XML_/':OUTFILENAME:'.xml'
+  RETURN
+
+EXIT:
 `
 
-func (q *QueryBatched) doSelect() (err error) {
+// Tprintf passed template string is formatted usign its operands and returns the resulting string.
+// Spaces are added between operands when neither is a string.
+// From: https://forum.golangbridge.org/t/named-string-formatting/3802/5
+func tprintf(tmpl string, data map[string]interface{}) string {
+	t := template.Must(template.New("udtsrc").Parse(tmpl))
+	buf := &bytes.Buffer{}
+	if err := t.Execute(buf, data); err != nil {
+		panic(fmt.Sprintf("Failed to render UDT source template: %s", err))
+	}
+	return buf.String()
+}
+
+func (q *QueryBatched) run() (err error) {
 
 	q.queryUUID, err = uuid.GenerateUUID()
 	if err != nil {
 		return
 	}
 
-	progSrc := fmt.Sprintf(selectSrcTmpl,
-		QuoteString(q.query.SelectStmt),
-		QuoteString(fmt.Sprintf("SAVE.LIST %s", QuoteString(q.queryUUID))),
-	)
-	progName := "SELECT-" + q.queryUUID
+	q.udtProgName = "ETL-" + q.queryUUID
+	progSrc := tprintf(udtProgSrcTmpl, map[string]interface{}{
+		"SelectStmt": QuoteString(q.query.SelectStmt),
+		"ListFile":   QuoteString(q.query.File),
+		"FileFields": QuoteString(strings.Join(q.query.Fields, " ")),
+		"QueryId":    QuoteString(q.queryUUID),
+		"BatchSize":  q.query.BatchSize,
+		"Debug":      1,
+	})
 
-	if err = q.client.CompileBasicProgram(udtProgFile, progName, progSrc); err != nil {
+	if err = q.client.CompileBasicProgram(udtProgFile, q.udtProgName, progSrc); err != nil {
 		return
 	}
 
-	r, err := q.client.ExecutePhantom(fmt.Sprintf("RUN %s '%s'", udtProgFile, progName))
-	if err != nil {
-		return
-	}
-	defer safeClose(r, "failed to close BASIC program response", &err)
-
-	if err = q.client.DeleteBasicProgram(udtProgFile, progName); err != nil {
-		return
-	}
-
-	buf, err := ioutil.ReadAll(r)
+	// The -N option disables output paging and is required to capture output longer than one screen
+	q.udtProc, err = q.client.Execute(fmt.Sprintf("RUN %s %s -N", udtProgFile, q.udtProgName))
 	if err != nil {
 		return
 	}
 
-	// Expecting output of the form: "\n10 records selected to list 0.\n\n10 key(s) saved to 1 record(s).\n"
-	re := regexp.MustCompile(`\n(\d+) key\(s\) saved to \d+ record\(s\).\n`)
-	matches := re.FindSubmatch(buf)
-	if matches == nil {
-		err = fmt.Errorf("unexpected response when selecting records: %s", buf)
-		return
-	}
+	q.procScanner = bufio.NewScanner(q.udtProc.Stdout)
+loop:
+	for q.procScanner.Scan() {
+		line := q.procScanner.Text()
+		if len(line) == 0 || line[0] != '|' {
+			continue
+		}
 
-	q.recordCount, err = strconv.Atoi(string(matches[1]))
-	if err != nil {
-		panic("doSelect: error parsing int")
+		// Remove the first pipe symbol and split the string
+		parts := strings.Split(line[1:], "|")
+
+		switch parts[0] {
+		case "SELECTED":
+			strCount := string(parts[1])
+			q.recordCount, err = strconv.Atoi(strCount)
+			if err != nil {
+				panic(fmt.Sprintf("Run: error parsing record count from SELECTED message. received (%s)", strCount))
+			}
+			break loop
+			//default:
+			//	log.Println("UDT Agent:", line)
+		}
+	}
+	if err := q.procScanner.Err(); err != nil {
+		return err
 	}
 
 	return
 }
-
-const batchSrcTmpl = `
-$BASICTYPE "U"
-
-** The name of the saved list to load record ids from
-LISTNAME = %s
-
-** File name to retrieve records from
-FILENAME = %s
-
-** Fields to list
-FILEFIELDS = %s
-
-** The index of the first record of the batch
-FIRSTI = %d
-
-** The maximum number of records to include in a batch
-BATCH = %d
-
-** =====
-
-** Load the saved list from file into select list 0
-GETLIST LISTNAME SETTING TCOUNT ELSE
-	PRINT "Failed to load select list ":LISTNAME
-	STOP
-END
-
-*PRINT TIMEDATE():" : Done, loaded ":TCOUNT:" records."
-
-*PRINT TIMEDATE():" : Build a dynamic array with only the record ids for this batch ..."
-
-** The index of the last record of the batch
-LASTI = FIRSTI + BATCH - 1
-
-RECORDS = ""
-
-I=0
-LOOP WHILE I <= LASTI DO
-
-	** Read the next record id from select list 0
-	READNEXT RECORD.ID ELSE
-		PRINT "Failed to READNEXT for record I=":I
-		EXIT
-	END
-
-	** If this record id is before the start of our batch, skip it
-	IF I < FIRSTI THEN
-		I += 1
-		CONTINUE
-	END
-
-	RECORDS = INSERT(RECORDS, -1, 0, 0, RECORD.ID)
-	I += 1
-REPEAT
-
-FORMLIST RECORDS TO 0
-
-LISTSTMT = "LIST ":FILENAME:" ":FILEFIELDS:" TOXML"
-
-EXECUTE LISTSTMT
-`
 
 func (q *QueryBatched) getNextBatch() error {
 
@@ -178,31 +234,46 @@ func (q *QueryBatched) getNextBatch() error {
 		batchSize = q.recordCount - q.batchCursor
 	}
 
-	progSrc := fmt.Sprintf(batchSrcTmpl,
-		QuoteString(q.queryUUID),
-		QuoteString(q.query.File),
-		QuoteString(strings.Join(q.query.Fields, " ")),
-		q.batchCursor,
-		batchSize,
-	)
-	progName := "LIST-" + q.queryUUID
+loop:
+	for q.procScanner.Scan() {
+		line := q.procScanner.Text()
+		if len(line) == 0 || line[0] != '|' {
+			continue
+		}
 
-	if err := q.client.CompileBasicProgram(udtProgFile, progName, progSrc); err != nil {
+		// Remove the first pipe symbol and split the string
+		parts := strings.Split(line[1:], "|")
+
+		switch parts[0] {
+		case "RESULTBATCH":
+			//log.Println("UDT Agent:", line)
+			path := parts[2]
+			// Assert the provided path is in the _XML_ sub-directory so we avoid accidentally
+			// deleting something important
+			if !strings.HasPrefix(parts[2], "_XML_/") {
+				panic(fmt.Sprintf("Unexpected file location given: %s", path))
+			}
+
+			f, err := q.client.RetrieveAndDeleteFile(path)
+			if err != nil {
+				panic(fmt.Sprintf("Failed to retrieve file contents: %s", err))
+			}
+
+			q.batchRecords = NewResults(f)
+			q.batchCursor += batchSize
+			break loop
+			//default:
+			//	log.Println("UDT Agent:", line)
+		}
+	}
+	if err := q.procScanner.Err(); err != nil {
 		return err
 	}
 
-	r, err := q.client.ExecutePhantom(fmt.Sprintf("RUN %s '%s'", udtProgFile, progName))
-	if err != nil {
-		return err
+	if q.batchRecords == nil {
+		return fmt.Errorf("getNextBatch: expected to receive RESULTBATCH message but never did.")
 	}
 
-	if err := q.client.DeleteBasicProgram(udtProgFile, progName); err != nil {
-		return err
-	}
-
-	q.batchRecords = NewResults(r)
-
-	q.batchCursor += batchSize
 	return nil
 }
 
@@ -249,7 +320,6 @@ func (q *QueryBatched) Close() error {
 	if q.err != nil {
 		return q.err
 	}
-
 	q.err = errors.New("record reader has already been closed")
 
 	if q.batchRecords != nil {
@@ -258,7 +328,7 @@ func (q *QueryBatched) Close() error {
 		}
 	}
 
-	if err := q.client.SavedListDelete(q.queryUUID); err != nil {
+	if err := q.client.DeleteBasicProgram(udtProgFile, q.udtProgName); err != nil {
 		return err
 	}
 
