@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/pkg/sftp"
-	"github.com/samuelhug/udt/truncatereader"
+	"github.com/samhug/udt/truncatereader"
 	"golang.org/x/crypto/ssh"
 )
 

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/samuelhug/udt"
+	"github.com/samhug/udt"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
