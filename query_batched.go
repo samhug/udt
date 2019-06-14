@@ -15,10 +15,10 @@ import (
 
 // QueryConfig represents a query to be run against a Unidata database
 type QueryConfig struct {
-	SelectStmt string
-	File       string
-	Fields     []string
-	BatchSize  int
+	Select    []string
+	File      string
+	Fields    []string
+	BatchSize int
 }
 
 const defaultBatchSize = 10000
@@ -62,9 +62,11 @@ const udtProgFile = "BP"
 const udtProgSrcTmpl = `
 $BASICTYPE "U"
 
-** Should be a statement that will populate select list 0
-** Ex: 'SELECT CUSTOMER'
-SELECTSTMT = {{.SelectStmt}}
+** Should be a list of statements that will populate select list 0
+SELECTSCRIPT = ''
+{{range .SelectScript}}
+SELECTSCRIPT = INSERT(SELECTSCRIPT, -1, 0, 0, {{.}})
+{{end}}
 
 ** File from which to list records
 ** Ex: 'CUSTOMER'
@@ -89,7 +91,7 @@ DEBUG = {{.Debug}}
 
 CURSOR = 0
 
-IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|will run (':SELECTSTMT:') and retrieve results from (':LISTFILE:') in batches of (':BATCHSIZE:')'
+IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|will run (':SELECTSCRIPT:') and retrieve results from (':LISTFILE:') in batches of (':BATCHSIZE:')'
 
 IF DEBUG=1 THEN PRINT '|DEBUG|':SYSTEM(12):'|select records'
 GOSUB DOSELECT
@@ -118,7 +120,7 @@ GOSUB EXIT
 ** ======
 
 DOSELECT:
-  EXECUTE SELECTSTMT
+  EXECUTE SELECTSCRIPT
   RECORDCOUNT = SYSTEM(11)
   EXECUTE 'SAVE.LIST'
   EXECUTE 'GET.LIST TO 1'
@@ -177,14 +179,19 @@ func (q *QueryBatched) run() (err error) {
 		return
 	}
 
+	quotedScript := make([]string, len(q.query.Select))
+	for i := 0; i < len(q.query.Select); i++ {
+		quotedScript[i] = QuoteString(q.query.Select[i])
+	}
+
 	q.udtProgName = "ETL-" + q.queryUUID
 	progSrc := tprintf(udtProgSrcTmpl, map[string]interface{}{
-		"SelectStmt": QuoteString(q.query.SelectStmt),
-		"ListFile":   QuoteString(q.query.File),
-		"FileFields": QuoteString(strings.Join(q.query.Fields, " ")),
-		"QueryId":    QuoteString(q.queryUUID),
-		"BatchSize":  q.query.BatchSize,
-		"Debug":      1,
+		"SelectScript": quotedScript,
+		"ListFile":     QuoteString(q.query.File),
+		"FileFields":   QuoteString(strings.Join(q.query.Fields, " ")),
+		"QueryId":      QuoteString(q.queryUUID),
+		"BatchSize":    q.query.BatchSize,
+		"Debug":        1,
 	})
 
 	if err = q.client.CompileBasicProgram(udtProgFile, q.udtProgName, progSrc); err != nil {

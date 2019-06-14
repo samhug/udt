@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -47,26 +48,45 @@ func main() {
 		return
 	}
 
-	conn := udt.NewConnection(sshClient, *udtBinPtr, *udtHomePtr, *udtAcctPtr)
+	envConfig := &udt.EnvConfig{
+		UdtBin:  *udtBinPtr,
+		UdtHome: *udtHomePtr,
+		UdtAcct: *udtAcctPtr,
+	}
 
-	fmt.Println("=== Example Basic ===")
-	fmt.Println("Query basic server information")
+	c := udt.NewClient(sshClient, envConfig)
 
-	// WHAT
-	// LIST DICT STUDENT
-	// LIST STUDENT LNAME CGA TOXML SAMPLE 1
-	proc, err := conn.ExecutePhantomAsync("LIST CUSTOMER NAME TAPE_INFO TOXML SAMPLE 1")
+	demoRaw(c, "WHAT")
+	//demoRaw(c, "LIST DICT STUDENT")
+	//demoRaw(c, "LIST STUDENT LNAME CGA TOXML SAMPLE 1")
+
+	demoQuery(c, "LIST CLIENTS NAME COMPANY ADDRESS SAMPLE 3 TOXML")
+
+	demoQueryBatched(c, &udt.QueryConfig{
+		Select:    []string{"SELECT ORDERS WITH ORD_DATE=\"10/25/2000\""},
+		File:      "ORDERS",
+		Fields:    []string{"ID", "ORD_DATE", "ORD_TIME"},
+		BatchSize: 25,
+	})
+
+}
+
+func demoRaw(c *udt.Client, statement string) {
+	fmt.Println("\n=== Demo Basic ===")
+	fmt.Println("=== Execute a raw statement and retrieve the output")
+
+	proc, err := c.ExecutePhantomAsync(statement)
 	if err != nil {
 		fmt.Printf("UDT Execute failed: %s", err)
 		return
 	}
 
-	if err := conn.Wait(proc); err != nil {
+	if err := c.WaitPhantom(proc); err != nil {
 		fmt.Printf("error waiting for process to terminate: %s", err)
 		return
 	}
 
-	buf, err := conn.RetrieveOutput(proc)
+	buf, err := c.RetrieveOutput(proc)
 	if err != nil {
 		fmt.Printf("unable to retrieve UDT output: %s", err)
 		return
@@ -78,34 +98,57 @@ func main() {
 		return
 	}
 	fmt.Println(string(out))
+}
 
-	/*
-		q := "LIST CLIENTS NAME COMPANY ADDRESS SAMPLE 3 TOXML"
+func demoQuery(c *udt.Client, query string) {
+	fmt.Println("\n=== Demo Query ===")
+	fmt.Printf("=== Run the query: %s\n", query)
 
-		fmt.Println("=== Example Query ===")
-		fmt.Println("Run the query:", q)
+	q := udt.NewQuery(query)
+	r, err := q.Run(c)
+	if err != nil {
+		fmt.Printf("Error running query: %s", err)
+		return
+	}
+	defer r.Close()
 
-		query := udt.NewQuery(q)
-		r, err := query.Run(conn)
+	for {
+		record, err := r.ReadRecord()
 		if err != nil {
-			fmt.Printf("Error running query: %s", err)
-			return
-		}
-		defer r.Close()
-
-		for {
-			record, err := r.ReadRecord()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				fmt.Printf("Error: %s\n", err)
+			if err == io.EOF {
 				break
 			}
-
-			fmt.Printf("%q\n", record)
+			fmt.Printf("Error: %s\n", err)
+			break
 		}
-	*/
+
+		fmt.Printf("%q\n", record)
+	}
+}
+
+func demoQueryBatched(c *udt.Client, queryCfg *udt.QueryConfig) {
+	fmt.Println("\n=== Demo Query Batched ===")
+	fmt.Printf("=== Run the query:\n=== %#v\n", queryCfg)
+
+	r, err := udt.NewQueryBatched(c, queryCfg)
+	if err != nil {
+		fmt.Printf("Error running query: %s", err)
+		return
+	}
+	defer r.Close()
+
+	for {
+		record, err := r.ReadRecord()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Printf("Error: %s\n", err)
+			break
+		}
+
+		fmt.Printf("%q\n", record)
+	}
 }
 
 // From https://stackoverflow.com/a/32768479/2069095
