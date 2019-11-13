@@ -5,21 +5,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // NewResults reads XML data and constructs a Results object from it
 func NewResults(xmlResults io.ReadCloser) *Results {
 
+	//buf := new(bytes.Buffer)
+	//buf.ReadFrom(xmlResults)
+	//ioutil.WriteFile("./out.xml", buf.Bytes(), 0644)
+
+	//r := ioutils.NewReadCloserWrapper(buf, xmlResults.Close)
+
+	d := xml.NewDecoder(xmlResults)
+
 	return &Results{
-		r:       xmlResults,
-		decoder: xml.NewDecoder(xmlResults),
+		closer:  xmlResults,
+		decoder: d,
 		err:     nil,
 	}
 }
 
 // Results parses XML results into json style objects
 type Results struct {
-	r              io.ReadCloser
+	closer         io.Closer
 	decoder        *xml.Decoder
 	err            error
 	inRootElem     bool
@@ -27,6 +36,15 @@ type Results struct {
 }
 
 // ReadRecord parses the XML response stream and returns the next record
+// The XML response stream is expected to be of the format
+// <?xml version="1.0"?>
+// <ROOT>
+// <RECORD FIELD1 = "VALUE">
+//   <_ID_MV>
+//     <_ID_MS _ID = "00001"/>
+//   </_ID_MV>
+// </RECORD>
+// </ROOT>
 func (r *Results) ReadRecord() (map[string]interface{}, error) {
 
 	if r.err != nil {
@@ -46,11 +64,10 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 		t, err := r.decoder.Token()
 		if err != nil {
 			r.err = err
-			return nil, r.err
-		}
-		if t == nil {
-			r.err = err
-			return nil, r.err
+			if err == io.EOF {
+				return nil, err
+			}
+			return nil, fmt.Errorf("failed to decode XML record: %w", err)
 		}
 
 		// Inspect the type of the token just read.
@@ -58,13 +75,18 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 		case xml.StartElement:
 			e, _ := t.(xml.StartElement)
 
+			// Is this the ROOT element
 			if se.Name.Local == "ROOT" {
 				r.inRootElem = true
 				continue
-			} else if r.inRootElem && r.recordElemName == "" {
+			}
+
+			// save the record element name
+			if r.inRootElem && r.recordElemName == "" {
 				r.recordElemName = se.Name.Local
 			}
 
+			// Is this a RECORD element
 			if r.inRootElem && se.Name.Local == r.recordElemName {
 				inRecordElem = true
 
@@ -72,9 +94,13 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				for _, attr := range e.Attr {
 					record[attr.Name.Local] = attr.Value
 				}
-			} else if inRecordElem && !inMVElem {
+				continue
+			}
+
+			// Is this a FIELD_MV element
+			if inRecordElem && !inMVElem {
 				// We're expecting an element name ending in "_MV"
-				if se.Name.Local[len(se.Name.Local)-3:] != "_MV" {
+				if !strings.HasSuffix(se.Name.Local, "_MV") {
 					r.err = fmt.Errorf("expected an element with a name ending in '_MV', got '%s' instead", se.Name.Local)
 					return nil, r.err
 				}
@@ -93,22 +119,13 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				}
 
 				record[mvElemName] = append(record[mvElemName].([]map[string]interface{}), mvRecord)
+				continue
+			}
 
-				/*
-					attrName := se.Name.Local[:len(se.Name.Local)-3]
-					if _, ok := record[attrName]; !ok {
-						record[attrName] = []string{}
-					}
-
-					if len(e.Attr) < 1 {
-						continue
-					}
-					attr := e.Attr[0]
-					record[attrName] = append(record[attrName].([]string), attr.Value)
-				*/
-			} else if inRecordElem && inMVElem {
+			// Is this a FIELD_MS element
+			if inRecordElem && inMVElem {
 				// We're expecting an element name ending in "_MS"
-				if se.Name.Local[len(se.Name.Local)-3:] != "_MS" {
+				if !strings.HasSuffix(se.Name.Local, "_MS") {
 					r.err = fmt.Errorf("expected an element with a name ending in '_MS', got '%s' instead", se.Name.Local)
 					return nil, r.err
 				}
@@ -128,7 +145,7 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 
 				// TODO: Sorry future me, I'm not proud of this...
 				record[mvElemName].([]map[string]interface{})[lmv-1][msElemName] = append(record[mvElemName].([]map[string]interface{})[lmv-1][msElemName].([]map[string]string), msRecord)
-
+				continue
 			}
 		case xml.EndElement:
 			if inRecordElem && se.Name.Local == r.recordElemName { // Exit record element
@@ -147,5 +164,5 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 // Close closes the reader that was passed to us
 func (r *Results) Close() error {
 	r.err = errors.New("results has already been closed")
-	return r.r.Close()
+	return r.closer.Close()
 }
