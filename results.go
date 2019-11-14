@@ -35,14 +35,21 @@ type Results struct {
 	recordElemName string
 }
 
+type xmlDataElement struct {
+	Data string `xml:",chardata"`
+}
+
 // ReadRecord parses the XML response stream and returns the next record
 // The XML response stream is expected to be of the format
 // <?xml version="1.0"?>
 // <ROOT>
-// <RECORD FIELD1 = "VALUE">
+// <RECORD>
 //   <_ID_MV>
-//     <_ID_MS _ID = "00001"/>
+//     <_ID_MS>
+//       <_ID>00001</_ID>
+//     </_ID_MS>
 //   </_ID_MV>
+//   <FIELD1>VALUE</FIELD1>
 // </RECORD>
 // </ROOT>
 func (r *Results) ReadRecord() (map[string]interface{}, error) {
@@ -54,7 +61,9 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 	record := make(map[string]interface{})
 	inRecordElem := false
 	inMVElem := false
+	inMSElem := false
 	mvElemName := ""
+	msElemName := ""
 
 	recordComplete := false
 
@@ -81,7 +90,8 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				continue
 			}
 
-			// save the record element name
+			// if we're in the ROOT element and we don't know the record element name yet
+			// this must be the record element name so we'll save it's name.
 			if r.inRootElem && r.recordElemName == "" {
 				r.recordElemName = se.Name.Local
 			}
@@ -97,13 +107,20 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				continue
 			}
 
-			// Is this a FIELD_MV element
-			if inRecordElem && !inMVElem {
-				// We're expecting an element name ending in "_MV"
-				if !strings.HasSuffix(se.Name.Local, "_MV") {
-					r.err = fmt.Errorf("expected an element with a name ending in '_MV', got '%s' instead", se.Name.Local)
+			// Is this a top-level FIELD element
+			if inRecordElem && !inMVElem && !strings.HasSuffix(se.Name.Local, "_MV") {
+				var dataEl xmlDataElement
+				if err := r.decoder.DecodeElement(&dataEl, &e); err != nil {
+					r.err = fmt.Errorf("failed to read element '%s': %w", se.Name.Local, err)
 					return nil, r.err
 				}
+
+				record[se.Name.Local] = dataEl.Data
+				continue
+			}
+
+			// Is this a FIELD_MV element
+			if inRecordElem && !inMVElem && strings.HasSuffix(se.Name.Local, "_MV") {
 				inMVElem = true
 				mvElemName = se.Name.Local
 
@@ -122,14 +139,24 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				continue
 			}
 
-			// Is this a FIELD_MS element
-			if inRecordElem && inMVElem {
-				// We're expecting an element name ending in "_MS"
-				if !strings.HasSuffix(se.Name.Local, "_MS") {
-					r.err = fmt.Errorf("expected an element with a name ending in '_MS', got '%s' instead", se.Name.Local)
+			// Is this a FIELD element in an MV element
+			if inRecordElem && inMVElem && !inMSElem && !strings.HasSuffix(se.Name.Local, "_MS") {
+				var dataEl xmlDataElement
+				if err := r.decoder.DecodeElement(&dataEl, &e); err != nil {
+					r.err = fmt.Errorf("failed to read element '%s': %w", se.Name.Local, err)
 					return nil, r.err
 				}
-				msElemName := se.Name.Local
+
+				lmv := len(record[mvElemName].([]map[string]interface{}))
+
+				record[mvElemName].([]map[string]interface{})[lmv-1][se.Name.Local] = dataEl.Data
+				continue
+			}
+
+			// Is this a FIELD_MS element
+			if inRecordElem && inMVElem && !inMSElem && strings.HasSuffix(se.Name.Local, "_MS") {
+				inMSElem = true
+				msElemName = se.Name.Local
 
 				msRecord := make(map[string]string)
 
@@ -147,14 +174,33 @@ func (r *Results) ReadRecord() (map[string]interface{}, error) {
 				record[mvElemName].([]map[string]interface{})[lmv-1][msElemName] = append(record[mvElemName].([]map[string]interface{})[lmv-1][msElemName].([]map[string]string), msRecord)
 				continue
 			}
+
+			// Is this a FIELD element in an MS element
+			if inRecordElem && inMSElem {
+				var dataEl xmlDataElement
+				if err := r.decoder.DecodeElement(&dataEl, &e); err != nil {
+					r.err = fmt.Errorf("failed to read element '%s': %w", se.Name.Local, err)
+					return nil, r.err
+				}
+
+				lmv := len(record[mvElemName].([]map[string]interface{}))
+				lms := len(record[mvElemName].([]map[string]interface{})[lmv-1][msElemName].([]map[string]string))
+
+				record[mvElemName].([]map[string]interface{})[lmv-1][msElemName].([]map[string]string)[lms-1][se.Name.Local] = dataEl.Data
+				continue
+			}
 		case xml.EndElement:
-			if inRecordElem && se.Name.Local == r.recordElemName { // Exit record element
+			if inRecordElem && !inMVElem && se.Name.Local == r.recordElemName { // Exit record element
 				inRecordElem = false
 				recordComplete = true
-			} else if inMVElem && se.Name.Local == mvElemName {
+			} else if inMVElem && !inMSElem && se.Name.Local == mvElemName { // Exit MV Element
 				inMVElem = false
 				mvElemName = ""
+			} else if inMSElem && se.Name.Local == msElemName { // Exit MS Element
+				inMSElem = false
+				msElemName = ""
 			}
+
 		}
 	}
 
