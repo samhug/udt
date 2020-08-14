@@ -6,18 +6,16 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 // NewResults reads XML data and constructs a Results object from it
 func NewResults(xmlResults io.ReadCloser) *Results {
 
-	//buf := new(bytes.Buffer)
-	//buf.ReadFrom(xmlResults)
-	//ioutil.WriteFile("./out.xml", buf.Bytes(), 0644)
+	r := charmap.ISO8859_1.NewDecoder().Reader(xmlResults)
 
-	//r := ioutils.NewReadCloserWrapper(buf, xmlResults.Close)
-
-	d := xml.NewDecoder(xmlResults)
+	d := xml.NewDecoder(r)
 
 	return &Results{
 		closer:  xmlResults,
