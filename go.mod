@@ -1,11 +1,11 @@
 module github.com/samhug/udt
 
-go 1.12
+go 1.14
 
 require (
 	github.com/hashicorp/go-uuid v1.0.2
-	github.com/pkg/sftp v1.12.0
-	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83
-	golang.org/x/sys v0.0.0-20210220050731-9a76102bfb43 // indirect
-	golang.org/x/text v0.3.5
+	github.com/pkg/sftp v1.13.4
+	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
+	golang.org/x/sys v0.0.0-20211029165221-6e7872819dc8 // indirect
+	golang.org/x/text v0.3.7
 )
